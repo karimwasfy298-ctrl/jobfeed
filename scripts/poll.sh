@@ -93,23 +93,36 @@ echo "Fetched $COUNT listings."
 
 # Verification mode: dump one row so field mapping can be checked against reality.
 if [[ "${DEBUG_DUMP:-0}" == "1" ]]; then
+  echo "── FIELD ENCODINGS ACROSS ALL $COUNT ROWS ──"
+  echo "experience_level values: $(jq -c '[.[].experience_level] | unique' <<<"$ROWS")"
+  echo "step2_type values:       $(jq -c '[.[].step2_type] | unique' <<<"$ROWS")"
+  echo "positions shapes:        $(jq -c '[.[].positions | type] | unique' <<<"$ROWS")"
+  echo "work_hours values:       $(jq -c '[.[].work_hours[]?] | unique' <<<"$ROWS")"
+  echo "time_commitment values:  $(jq -c '[.[].time_commitment[]?] | unique' <<<"$ROWS")"
+  echo "rows lacking application_url: $(jq '[.[] | select((.application_url // "") == "")] | length' <<<"$ROWS")"
+  echo ""
   echo "── SAMPLE ROW ──"
   jq '.[0]' <<<"$ROWS"
-  echo "── KEYS ──"
-  jq -r '.[0] | keys_unsorted[]' <<<"$ROWS"
-  exit 0
+  echo ""
+  DRY_RUN=1
 fi
 
 # ── 3. Work out what's new ────────────────────────────────────────────────────
 NEWEST=$(jq -r '.[0].created_at' <<<"$ROWS")
 
-if [[ -f "$STATE_FILE" ]]; then
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  # Debug: render the 2 newest regardless of watermark, post nothing.
+  NEW=$(jq -c '[limit(2; .[])] | reverse' <<<"$ROWS")
+  LAST=""
+elif [[ -f "$STATE_FILE" ]]; then
   LAST=$(jq -r '.last_seen // ""' "$STATE_FILE")
 else
   LAST=""
 fi
 
-if [[ -z "$LAST" ]]; then
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  : # NEW already set above
+elif [[ -z "$LAST" ]]; then
   # First ever run: start clean unless a backfill was explicitly requested.
   N="${BACKFILL:-0}"
   if [[ "$N" -gt 0 ]]; then
@@ -161,6 +174,13 @@ for i in $(seq 0 $((NEW_COUNT - 1))); do
                else "**$" + (. | floor | tostring
                     | [scan("\\d{1,3}(?=(?:\\d{3})*$)")] | join(",")) + "**/mo" end;
     def clip($n): if (. | length) > $n then (.[0:$n] + "…") else . end;
+    # Compact currency for revenue / ticket size: 250000 -> $250k, 1500000 -> $1.5M
+    def kfmt: if . == null or . == 0 then null
+              elif . >= 1000000 then "$" + (((. / 100000) | floor) / 10 | tostring) + "M"
+              elif . >= 1000     then "$" + ((. / 1000) | floor | tostring) + "k"
+              else "$" + (. | floor | tostring) end;
+    # experience_level arrives as an integer index, not a label
+    def explevel: {"0":"0-3mo","1":"3-6mo","2":"6-12mo","3":"12-24mo","4":"24mo+","5":"24mo+"};
 
     # positions may arrive as an array or a single string
     ($j.positions
@@ -204,25 +224,63 @@ for i in $(seq 0 $((NEW_COUNT - 1))); do
 
     | ($j.application_details_url // "") as $details
 
+    # The board spreads its apply flow across step1..step6.
+    | ([ range(1;7)
+         | { n: .,
+             lbl: ($j["step\(.)_label"]   // ""),
+             cnt: ($j["step\(.)_content"] // "") }
+         | select(.lbl != "" or .cnt != "") ]) as $steps
+
+    | (($j.work_hours // []) + ($j.time_commitment // []) | join(" • ")) as $schedule
+    | (if ($j.business_website // "") != "" then $j.business_website
+       elif ($j.business_social // "") != "" then $j.business_social
+       else "" end) as $companyUrl
+
     | {
         username: "Job Board",
         embeds: [ {
           title: ($j.title // "New job posting" | clip(250)),
           url: $board,
           color: $color,
+          description: (if ($j.offer_description // "") != ""
+                        then "*" + ($j.offer_description | clip(300)) + "*" else null end),
           fields: (
             [ { name: "Role",  value: (if $roleLabel == "" then "—" else $roleLabel end), inline: true } ]
             + (if ($ote | money) then [ { name: "OTE", value: ($ote | money), inline: true } ] else [] end)
-            + (if ($j.niche // "") != ""            then [ { name: "Niche",      value: ($j.niche | clip(200)), inline: true } ] else [] end)
-            + (if ($j.experience_level // "") != "" then [ { name: "Experience", value: ($j.experience_level | tostring), inline: true } ] else [] end)
-            + (if ($j.poc_name // "") != ""         then [ { name: "Recruiter",  value: ($j.poc_name | clip(200)), inline: true } ] else [] end)
-            + (if ($j.business_website // "") != "" then [ { name: "Company",    value: ("[Website](" + $j.business_website + ")"), inline: true } ] else [] end)
-            + (if ($j.application_instructions // "") != "" then
-                 [ { name: "⁣", value: "⁣", inline: false },
-                   { name: ":clipboard: How to Apply",
-                     value: (">>> " + ($j.application_instructions | clip(950))),
+            + (if ($j.monthly_revenue | kfmt) then
+                 [ { name: "Revenue", value: (($j.monthly_revenue | kfmt) + "/mo"), inline: true } ] else [] end)
+            + (if ($j.niche // "") != "" then [ { name: "Niche", value: ($j.niche | clip(200)), inline: true } ] else [] end)
+            + (if $j.experience_level != null then
+                 [ { name: "Experience",
+                     value: (explevel[$j.experience_level | tostring] // ($j.experience_level | tostring)),
+                     inline: true } ] else [] end)
+            + (if ($j.ticket_size_max | kfmt) then
+                 [ { name: "Ticket",
+                     value: ((if ($j.ticket_size_min | kfmt) then ($j.ticket_size_min | kfmt) + "–" else "" end)
+                             + ($j.ticket_size_max | kfmt)),
+                     inline: true } ] else [] end)
+            + (if ($j.poc_name // "") != "" then [ { name: "Recruiter", value: ($j.poc_name | clip(200)), inline: true } ] else [] end)
+            + (if $companyUrl != "" then [ { name: "Company", value: ("[Link](" + $companyUrl + ")"), inline: true } ] else [] end)
+            + (if $schedule != "" then [ { name: "Schedule", value: ($schedule | clip(200)), inline: true } ] else [] end)
+
+            + (if ($j.notes // "") != "" then
+                 [ { name: ":pushpin: Requirements", value: ($j.notes | clip(900)), inline: false } ]
+               else [] end)
+
+            + (if ($j.application_instructions // "") != "" or ($steps | length) > 0 then
+                 [ { name: ":clipboard: How to Apply",
+                     value: (
+                       (if ($j.application_instructions // "") != ""
+                        then ">>> " + ($j.application_instructions | clip(600)) + "\n" else "" end)
+                       + ($steps | map(
+                           "**" + (.n | tostring) + ".** "
+                           + (if .lbl != "" then (.lbl | clip(120)) else "Step" end)
+                           + (if (.cnt | test("^https?://")) then " — [open](" + .cnt + ")" else "" end)
+                         ) | join("\n"))
+                     ) | clip(1020),
                      inline: false } ]
                else [] end)
+
             + [ { name: ":arrow_forward: Apply",
                   value: (
                     (if $apply then "**[" + ($apply.text | clip(80)) + "](" + $apply.url + ")**\n" else "" end)
@@ -236,6 +294,15 @@ for i in $(seq 0 $((NEW_COUNT - 1))); do
         } ]
       }
   ')
+
+  # Debug: show the finished embed instead of sending it.
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    echo "──────── EMBED $((i + 1)) of $NEW_COUNT ────────"
+    echo "job: $(jq -r '.title' <<<"$JOB")"
+    jq '.embeds[0]' <<<"$PAYLOAD"
+    echo ""
+    continue
+  fi
 
   # Post, honouring Discord rate limits (429 -> wait and retry once).
   for attempt in 1 2 3; do
@@ -265,6 +332,11 @@ for i in $(seq 0 $((NEW_COUNT - 1))); do
 
   sleep 1
 done
+
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  echo "DRY RUN — nothing was posted and the watermark was not touched."
+  exit 0
+fi
 
 echo "Posted $POSTED job(s)."
 
