@@ -180,7 +180,8 @@ for i in $(seq 0 $((NEW_COUNT - 1))); do
               elif . >= 1000     then "$" + ((. / 1000) | floor | tostring) + "k"
               else "$" + (. | floor | tostring) end;
     # experience_level arrives as an integer index, not a label
-    def explevel: {"0":"0-3mo","1":"3-6mo","2":"6-12mo","3":"12-24mo","4":"24mo+","5":"24mo+"};
+    # Levels observed in live data are 1..4 with no 0, so treat as 1-indexed.
+    def explevel: {"1":"0-3mo","2":"3-6mo","3":"6-12mo","4":"12-24mo","5":"24mo+"};
 
     # positions may arrive as an array or a single string
     ($j.positions
