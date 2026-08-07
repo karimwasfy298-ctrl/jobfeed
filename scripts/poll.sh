@@ -26,6 +26,23 @@ for v in BOARD_EMAIL BOARD_PASSWORD DISCORD_WEBHOOK; do
   [[ -n "${!v:-}" ]] || die "Missing required secret: $v"
 done
 
+# Strip stray whitespace/CR that copy-paste into the secrets UI commonly adds.
+trim() { printf '%s' "$1" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+RAW_EMAIL_LEN=${#BOARD_EMAIL}
+RAW_PASS_LEN=${#BOARD_PASSWORD}
+BOARD_EMAIL=$(trim "$BOARD_EMAIL")
+BOARD_PASSWORD=$(trim "$BOARD_PASSWORD")
+
+if [[ "${DEBUG_DUMP:-0}" == "1" ]]; then
+  echo "── CREDENTIAL SHAPE (no values shown) ──"
+  echo "email: raw_len=$RAW_EMAIL_LEN trimmed_len=${#BOARD_EMAIL} domain=@${BOARD_EMAIL##*@}"
+  echo "pass:  raw_len=$RAW_PASS_LEN trimmed_len=${#BOARD_PASSWORD}"
+  [[ "$RAW_EMAIL_LEN" != "${#BOARD_EMAIL}" ]] && echo "  !! email had surrounding whitespace — trimmed"
+  [[ "$RAW_PASS_LEN"  != "${#BOARD_PASSWORD}" ]] && echo "  !! password had surrounding whitespace — trimmed"
+  [[ "$BOARD_EMAIL" == *" "* ]] && echo "  !! email contains an interior space"
+  echo "───────────────────────────────────────"
+fi
+
 # ── 1. Authenticate ───────────────────────────────────────────────────────────
 # The board's RLS blocks anonymous reads of job_listings, so we mint a fresh
 # 1-hour JWT on every run. Stateless — nothing to expire or rotate.
@@ -40,9 +57,23 @@ AUTH_RESP=$(curl -sS -X POST \
   "$SUPABASE_URL/auth/v1/token?grant_type=password")
 
 TOKEN=$(jq -r '.access_token // empty' <<<"$AUTH_RESP")
+
+# Some providers normalise the address; retry once lowercased before giving up.
+if [[ -z "$TOKEN" && "$BOARD_EMAIL" != "$(tr '[:upper:]' '[:lower:]' <<<"$BOARD_EMAIL")" ]]; then
+  echo "Retrying with lowercased email…"
+  AUTH_RESP=$(curl -sS -X POST -H "apikey: $ANON_KEY" -H "Content-Type: application/json" \
+    -d "$(jq -n --arg e "$(tr '[:upper:]' '[:lower:]' <<<"$BOARD_EMAIL")" --arg p "$BOARD_PASSWORD" '{email:$e,password:$p}')" \
+    "$SUPABASE_URL/auth/v1/token?grant_type=password")
+  TOKEN=$(jq -r '.access_token // empty' <<<"$AUTH_RESP")
+fi
+
 if [[ -z "$TOKEN" ]]; then
-  # Never echo the raw response — it can contain token material.
-  die "Login failed: $(jq -r '.error_code // .msg // "unknown error"' <<<"$AUTH_RESP")"
+  # Only error fields — never the raw response, which can carry token material.
+  echo "::error::Login failed"
+  echo "  error_code: $(jq -r '.error_code // "—"' <<<"$AUTH_RESP")"
+  echo "  msg:        $(jq -r '.msg // .error_description // .error // "—"' <<<"$AUTH_RESP")"
+  echo "  http_keys:  $(jq -r 'keys_unsorted | join(",")' <<<"$AUTH_RESP" 2>/dev/null || echo 'unparseable')"
+  exit 1
 fi
 echo "Authenticated."
 
