@@ -120,20 +120,21 @@ else
   LAST=""
 fi
 
+N="${BACKFILL:-0}"
+[[ "$N" =~ ^[0-9]+$ ]] || N=0
+
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   : # NEW already set above
+elif [[ "$N" -gt 0 ]]; then
+  # Explicit backfill wins over the watermark, so the feed can be demoed or
+  # replayed on demand without hand-editing state.
+  echo "Backfill requested: posting the $N newest regardless of watermark."
+  NEW=$(jq -c --argjson n "$N" '[limit($n; .[])] | reverse' <<<"$ROWS")
 elif [[ -z "$LAST" ]]; then
-  # First ever run: start clean unless a backfill was explicitly requested.
-  N="${BACKFILL:-0}"
-  if [[ "$N" -gt 0 ]]; then
-    echo "First run: backfilling $N newest."
-    NEW=$(jq -c --argjson n "$N" '[limit($n; .[])] | reverse' <<<"$ROWS")
-  else
-    echo "First run: setting watermark to $NEWEST, posting nothing."
-    mkdir -p state
-    jq -n --arg t "$NEWEST" '{last_seen:$t}' > "$STATE_FILE"
-    exit 0
-  fi
+  echo "First run: setting watermark to $NEWEST, posting nothing."
+  mkdir -p state
+  jq -n --arg t "$NEWEST" '{last_seen:$t}' > "$STATE_FILE"
+  exit 0
 else
   # Strictly greater than the watermark — equal timestamps are already posted.
   NEW=$(jq -c --arg last "$LAST" '[.[] | select(.created_at > $last)] | reverse' <<<"$ROWS")
@@ -151,6 +152,7 @@ fi
 
 # ── 4. Build + send one embed per job ─────────────────────────────────────────
 POSTED=0
+FAILED=0
 HIGHWATER="$LAST"
 
 for i in $(seq 0 $((NEW_COUNT - 1))); do
@@ -294,6 +296,19 @@ for i in $(seq 0 $((NEW_COUNT - 1))); do
           timestamp: $j.created_at
         } ]
       }
+
+    # Enforce Discord limits: no empty names/values, 1024 per value, 25 fields,
+    # 256-char title. A single violation makes the whole webhook call 400.
+    | .embeds[0].fields |= ( map(
+          .name  = ((.name  // "") | tostring)
+        | .value = ((.value // "") | tostring)
+        | select((.name | length) > 0 and (.value | length) > 0)
+        | .name  = (if (.name  | length) > 256  then (.name[0:253]  + "…") else .name  end)
+        | .value = (if (.value | length) > 1024 then (.value[0:1021] + "…") else .value end)
+      ) | .[0:25] )
+    | .embeds[0].title = ((.embeds[0].title // "New job posting")[0:256])
+    | (if ((.embeds[0].description // "") | length) == 0
+       then .embeds[0] |= del(.description) else . end)
   ')
 
   # Debug: show the finished embed instead of sending it.
@@ -317,19 +332,22 @@ for i in $(seq 0 $((NEW_COUNT - 1))); do
       echo "Rate limited; sleeping ${WAIT}s"
       sleep "$WAIT"
     else
-      echo "::warning::Discord returned $HTTP: $(head -c 300 /tmp/dresp)"
+      echo "::warning::Discord returned $HTTP for \"$(jq -r '.title' <<<"$JOB")\""
+      echo "  response: $(head -c 600 /tmp/dresp)"
       break
     fi
   done
 
   if [[ "$HTTP" == "204" || "$HTTP" == "200" ]]; then
     POSTED=$((POSTED + 1))
-    # Only advance the watermark past jobs we actually delivered.
-    HIGHWATER=$(jq -r '.created_at' <<<"$JOB")
   else
-    echo "::error::Failed to post \"$(jq -r '.title' <<<"$JOB")\" — stopping so it retries next run."
-    break
+    # Skip rather than stop: one permanently-malformed listing must not block
+    # every job behind it forever. Loud in the log so it can be investigated.
+    FAILED=$((FAILED + 1))
+    echo "::error::Skipping \"$(jq -r '.title' <<<"$JOB")\" after $HTTP — see response above."
   fi
+  # Advance past this job either way, so a bad row cannot wedge the queue.
+  HIGHWATER=$(jq -r '.created_at' <<<"$JOB")
 
   sleep 1
 done
@@ -339,7 +357,7 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
-echo "Posted $POSTED job(s)."
+echo "Posted $POSTED job(s); $FAILED skipped."
 
 # ── 5. Persist watermark ──────────────────────────────────────────────────────
 if [[ -n "$HIGHWATER" && "$HIGHWATER" != "$LAST" ]]; then
