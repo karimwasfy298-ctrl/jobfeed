@@ -292,7 +292,6 @@ for i in $(seq 0 $((NEW_COUNT - 1))); do
                   ),
                   inline: false } ]
           ),
-          footer: { text: "Closing Saif Job Board" },
           timestamp: $j.created_at
         } ]
       }
