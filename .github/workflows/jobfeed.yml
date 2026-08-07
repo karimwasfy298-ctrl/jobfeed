@@ -1,0 +1,51 @@
+name: Job Board → Discord
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"   # every 15 min, off the :00 mark to dodge GitHub's queue spike
+  workflow_dispatch:               # lets you run it manually from the Actions tab
+    inputs:
+      debug:
+        description: "Dump one raw job row and exit (posts nothing)"
+        type: boolean
+        default: false
+      backfill:
+        description: "First run only: post this many recent jobs (0 = start clean)"
+        type: string
+        default: "0"
+
+# Needed so the run can commit the watermark file back to the repo
+permissions:
+  contents: write
+
+concurrency:
+  group: jobfeed
+  cancel-in-progress: false        # never run two pollers at once — that double-posts
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Poll board and post new jobs
+        env:
+          BOARD_EMAIL:    ${{ secrets.BOARD_EMAIL }}
+          BOARD_PASSWORD: ${{ secrets.BOARD_PASSWORD }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DEBUG_DUMP: ${{ inputs.debug == true && '1' || '0' }}
+          BACKFILL: ${{ inputs.backfill || '0' }}
+        run: bash scripts/poll.sh
+
+      - name: Save watermark
+        run: |
+          if [[ -n "$(git status --porcelain state/)" ]]; then
+            git config user.name  "jobfeed-bot"
+            git config user.email "jobfeed-bot@users.noreply.github.com"
+            git add state/
+            git commit -m "chore: update watermark [skip ci]"
+            # Retry once if another run pushed first
+            git push || (git pull --rebase && git push)
+          else
+            echo "No new jobs — watermark unchanged."
+          fi
